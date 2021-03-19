@@ -1,0 +1,319 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <math.h>
+#include "mycom.h"
+#include "mynet.h"
+
+typedef struct tag_data_t {
+  int nx, ny, nz, nxt, nyt, nzt, mxt, myt, mzt;
+  double ax, bx, ay, by, az, bz, s, *sumt;
+} data_t;
+
+pthread_t* threads;
+data_t* data;
+
+double f1(double x);
+double f1(double x) {
+  return sin(x);
+}
+
+double f2(double x);
+double f2(double x) {
+  return 9.0*x*x;
+}
+
+double f3(double x);
+double f3(double x) {
+  return sqrt(x);
+}
+
+double f(double x, double y, double z);
+double f(double x, double y, double z) {
+  return f1(x)*f2(y)*f3(z);
+}
+
+double integrate(double f(double x, double y, double z), int i1, int i2, int j1, int j2, int k1, int k2,
+double xa, double xb, double ya, double yb, double za, double zb);
+double integrate(double f(double x, double y, double z), int i1, int i2, int j1, int j2, int k1, int k2,
+double xa, double xb, double ya, double yb, double za, double zb)
+{
+  int i, j, k; double hx, hy, hz, hxyz, s;
+  
+  hx = (xb-xa)/nx; hy = (yb-ya)/ny; hz = (zb-za)/nz; hxyz = hx*hy*hz;
+
+  //h = (b - a) / n;
+  //s = 0.5 * f(a);
+  //for (i=1; i<n-1; i++)
+    //s = s + f(a+h*i);
+  //s = s + 0.5 * f(b);
+  
+  s = 0;
+  
+  for(k=k1; k<=k2; k++) {
+	  z = za + (k*1.0+.5)*hz;
+	  for (j=j1; j<=j2; j++) {
+		  y = ya + (j*1.0+.5)*hy;
+		  for (i=i1; i<=i2; i++) {
+			  x = xa + (i*1.0+.5)*hx;
+			  s = s + hxyz * f(x,y,z);
+			  }
+			  }
+			  }
+
+  return s;
+}
+
+void* myjobt(void* d);
+void* myjobt(void* d)
+{
+  int nx1, ny1, nz1; double ax1, bx1, ay1, by1, az1, bz1, hx1, hy1, hz1;
+  data_t* dd = (data_t *)d;
+
+  nx1 = dd->nx / (np1 * dd->nxt);
+  ny1 = dd->ny / (np2 * dd->nyt);
+  nz1 = dd->nz / (np3 * dd->nzt);
+
+  hx1 = (dd->bx - dd->ax) / (np1 * dd->nxt);
+  hy1 = (dd->by - dd->ay) / (np2 * dd->nyt);
+  hz1 = (dd->bz - dd->az) / (np3 * dd->nzt);
+
+  ax1 = dd->ax + mp1*(dd->bx - dd->ax)/np1 + hx1 * dd->mxt;
+  ay1 = dd->ay + mp2*(dd->by - dd->ay)/np2 + hy1 * dd->myt;
+  az1 = dd->az + mp3*(dd->bz - dd->az)/np3 + hz1 * dd->mzt;
+
+  //if (dd->mt<dd->nt-1) b1 = a1 + h1; else b1 = dd->b;
+  bx1 = ax1 + hx1;
+  by1 = ay1 + hy1;
+  bz1 = az1 + hz1;
+
+  //dd->s = integrate(f1,a1,b1,n1);
+  
+  dd->s = integrate(f, i1, i2, j1, j2, k1, k2, nx, ny, nz);
+
+  printf("mt=%d a1=%le b1=%le n1=%d s1=%le\n",dd->mt,a1,b1,n1,dd->s);
+
+  //pthread_mutex_lock(&mut); // lock
+
+  *dd->sumt += dd->s;
+
+  //pthread_mutex_unlock(&mut); // unlock
+
+  return 0;
+}
+
+
+void ThreadInit();
+void ThreadInit()
+{
+	int i;
+
+  if (!(threads = (pthread_t*) malloc(nt*sizeof(pthread_t))))
+    myerr("Not enough memory",1);
+
+  if (!(data = (data_t*) malloc(nt*sizeof(data_t))))
+    myerr("Not enough memory",1);
+
+  for (i=0; i<nt; i++){
+    (data+i)->ax=xa;
+    (data+i)->bx=xb;
+    (data+i)->ay=ya;
+    (data+i)->by=yb;
+    (data+i)->az=za;
+    (data+i)->bz=zb;
+    (data+i)->nx=nx;
+    (data+i)->ny=ny;
+    (data+i)->nz=nz;
+    (data+i)->nt=nt;
+    (data+i)->mt=i;
+    (data+i)->sumt = &sumt;
+    if (pthread_create(threads+i,0,myjobt,(void*)(data+i)))
+      myerr("Can not create thread",2);
+  }
+
+  return;
+}
+
+void ThreadDone();
+void ThreadDone()
+{
+  int i;
+
+  for (i=0; i<nt; i++)
+    if (pthread_join(threads[i],0))
+      myerr("Can not wait thread",3);
+
+  free(data);
+
+  free(threads);
+
+  return;
+} 
+
+
+int np, mp, nl, ier, lp;
+int np1, np2, np3, mp1, mp2, mp3;
+char pname[MPI_MAX_PROCESSOR_NAME];
+//char sname[10] = "ex08b.p00";
+MPI_Status Sta[100];
+MPI_Request Req[100];
+union_t buf;
+double tick, t1, t2, t3;
+
+FILE *Fi = NULL;
+FILE *Fo = NULL;
+int nx, ny, nz, fl=1;
+double xa, xb, ya, yb, za, zb;
+
+
+double myjob(int mp1, int mp2, int mp3);
+double myjob(int mp1, int mp2, int mp3)
+{
+	int i, i1, i2, j, j1, j2, k, k1, k2;
+	double s, p, x, y, z, hx, hy, hz, hxyz;
+	
+	if (np1==1) { i1 = 0; i2 = nx-1; }
+  else {
+    i1 = mp1 * (nx/np1);
+    if (mp1<np1-1) i2 = i1+(nx/np1)-1; else i2 = nx-1;
+  }
+
+  if (np2==1) { j1 = 0; j2 = ny-1; }
+  else {
+    j1 = mp2 * (ny/np2); 
+    if (mp2<np2-1) j2 = j1+(ny/np2)-1; else j2 = ny-1;
+  }
+  
+  if (np3==1) { k1 = 0; k2 = nz-1; }
+  else {
+    k1 = mp3 * (nz/np3); 
+    if (mp3<np3-1) k2 = k1+(nz/np3)-1; else k2 = nz-1;
+  } 
+	
+  
+  if (nt<2)
+  //s1 = integrate(f1,a1,b1,n1);
+  s1 = integrate(f, i1, i2, j1, j2, k1, k2, nx, ny, nz);
+  else {
+    ThreadInit();
+
+    ThreadDone();
+    
+    s1 = sumt;
+  }
+
+
+  return s1;
+}
+
+
+int main(int argc, char *argv[])
+{
+  double s;
+
+  MyNetInit(&argc,&argv,&np,&mp,&nl,pname,&tick);
+
+  //fprintf(stderr,"Netsize: %d, process: %d, system: %s, tick=%12le\n",np,mp,pname,tick);
+  sleep(1);
+
+  //sprintf(sname+7,"%02d",mp);
+  //ier = fopen_m(&Fo,sname,"wt");
+  //if (ier!=0) mpierr("Protocol file not opened",1);
+//printf(")))))))))))))))");
+  if (mp==0) {
+	  xa = 0.0;
+	  xb = pi;
+	  ya = 0.0;
+	  yb = 1.0;
+	  za = 0.0;
+	  zb = 1.0;
+	  nx = 1000;
+	  ny = 1500;
+	  nz = 2700;
+  }
+
+
+  if (np>1) {
+      if (mp==0) {
+        buf.ddata[0] = xa; buf.ddata[1] = xb;
+        buf.ddata[2] = ya; buf.ddata[3] = yb;
+        buf.ddata[4] = ya; buf.ddata[5] = yb;
+        buf.idata[0] = nx; buf.idata[1] = ny; buf.idata[2] = nz;
+      }
+      MPI_Bcast(buf.ddata,6,MPI_DOUBLE,0,MPI_COMM_WORLD);
+      MPI_Bcast(buf.idata,3,MPI_INT,0,MPI_COMM_WORLD);
+      if (mp>0) {
+        xa = buf.ddata[0]; xb = buf.ddata[1];
+        ya = buf.ddata[2]; yb = buf.ddata[3];
+        za = buf.ddata[4]; zb = buf.ddata[5];
+        nx = buf.idata[0]; ny = buf.idata[1]; nz = buf.idata[2];
+      }
+  }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+
+// Next code:
+
+  if (np==1) { np1 = 1; np2 = 1; np3 = 1; }
+  else {
+    s = ((double)np) * ( ((double)ny) / ((double)nx) );
+    s = pow(s,1.0/3.0);
+    //printf("s=%5le\n",s);
+    np2 = floor(s); if (s>0.5+((double)np2)) np2++;
+    s = ((double)np) * ( ((double)nz) / ((double)nx) );
+    s = pow(s,1.0/3.0);
+    np3 = floor(s); if (s>0.5+((double)np3)) np3++;
+    //s = ((double)nz) * ((double)np1) / ((double)nx);
+    //np3 = floor(s); if (s>0.5+((double)np3)) np3++;
+    if (np2 == 0)
+    np2 = 1;
+    if (np3 == 0)
+    np3 = 1;
+    np1 = np / (np3 * np2);
+    if ((np1*np2*np3)!=np) {
+		//printf(")))))))))))))))");
+      if (nx>(ny + nz)) {np1 = np; np2 = 1; np3 = 1;} else if (ny>(nx + nz)) {np1 = 1; np2 = np; np3 = 1;} else {np1 = 1; np2 = 1; np3 = np;}
+    }
+  }
+  
+  mp3 = mp / (np1 * np2);
+  mp2 = (mp - mp3*np1*np2) / np1;
+  mp1 = mp % np1;
+
+  if (mp==0) fprintf(stderr,"Grid=%dx%dx%d\n",np1,np2,np3);
+  
+  printf("Netsize: %d, process: %d, system: %s, tick=%12le\n",np,mp,pname,tick);
+  printf("Grid=%dx%dx%d coord=(%d,%d,%d)\n",np1,np2,np3,mp1,mp2,mp3);
+  printf("xa=%le xb=%le ya=%le yb=%le za=%le zb=%le nx=%d ny=%d nz=%d\n",xa,xb,ya,yb,za,zb,nx,ny,nz);
+
+  t1 = MPI_Wtime();
+  
+  s = myjob();
+
+  //hx = (xb-xa)/nx; hy = (yb-ya)/ny; hz = (zb-za)/nz; hxyz = hx*hy*hz;
+
+
+  t2 = MPI_Wtime();
+
+  t1 = t2 - t1;
+
+  if (np==1)
+    t2 = 0;
+  else {
+    p = s;
+    MPI_Reduce(&p, &s, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    t2 = MPI_Wtime()-t2;
+  }
+
+  t3 = t1 + t2;
+
+  if (mp==0) printf("t1=%le t2=%le t3=%le int=%le\n",t1,t2,t3,s);
+  
+  //printf("i1=%d i2=%d j1=%d j2=%d k1=%d k2=%d\n",i1,i2,j1,j2,k1,k2);
+  //printf("t1=%le t2=%le t3=%le int=%le\n",t1,t2,t3,s);
+
+
+  MPI_Finalize();
+  return 0;
+}
